@@ -1,0 +1,39 @@
+[0.497s] Invoking command in '/home/awear/ros2_ws/src/cdrr_adaptive_ros2': PYTHONPATH=/home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base build/cdrr_adaptive_ros2 build --build-base /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build install --record /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/install.log --single-version-externally-managed install_data
+[0.621s] running egg_info
+[0.622s] creating build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info
+[0.622s] writing build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/PKG-INFO
+[0.623s] writing dependency_links to build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/dependency_links.txt
+[0.623s] writing entry points to build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/entry_points.txt
+[0.623s] writing requirements to build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/requires.txt
+[0.623s] writing top-level names to build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/top_level.txt
+[0.623s] writing manifest file 'build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/SOURCES.txt'
+[0.624s] reading manifest file 'build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/SOURCES.txt'
+[0.624s] writing manifest file 'build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info/SOURCES.txt'
+[0.625s] running build
+[0.625s] running build_py
+[0.625s] creating /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build
+[0.625s] creating /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib
+[0.625s] creating /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib/cdrr_adaptive_ros2
+[0.625s] copying cdrr_adaptive_ros2/simulation_env.py -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib/cdrr_adaptive_ros2
+[0.625s] copying cdrr_adaptive_ros2/adaptive_learning.py -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib/cdrr_adaptive_ros2
+[0.625s] copying cdrr_adaptive_ros2/__init__.py -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib/cdrr_adaptive_ros2
+[0.626s] running install
+[0.626s] running install_lib
+[0.626s] creating /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2
+[0.626s] copying /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib/cdrr_adaptive_ros2/simulation_env.py -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2
+[0.626s] copying /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib/cdrr_adaptive_ros2/adaptive_learning.py -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2
+[0.627s] copying /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build/lib/cdrr_adaptive_ros2/__init__.py -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2
+[0.627s] byte-compiling /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2/simulation_env.py to simulation_env.cpython-310.pyc
+[0.628s] byte-compiling /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2/adaptive_learning.py to adaptive_learning.cpython-310.pyc
+[0.628s] byte-compiling /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2/__init__.py to __init__.cpython-310.pyc
+[0.629s] running install_data
+[0.629s] creating /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/share/ament_index
+[0.629s] creating /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/share/ament_index/resource_index
+[0.629s] creating /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/share/ament_index/resource_index/packages
+[0.629s] copying resource/cdrr_adaptive_ros2 -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/share/ament_index/resource_index/packages
+[0.629s] copying package.xml -> /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/share/cdrr_adaptive_ros2
+[0.629s] running install_egg_info
+[0.631s] Copying build/cdrr_adaptive_ros2/cdrr_adaptive_ros2.egg-info to /home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages/cdrr_adaptive_ros2-0.0.0-py3.10.egg-info
+[0.631s] running install_scripts
+[0.642s] writing list of installed files to '/home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/install.log'
+[0.657s] Invoked command in '/home/awear/ros2_ws/src/cdrr_adaptive_ros2' returned '0': PYTHONPATH=/home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/awear/ros2_ws/src/cdrr_adaptive_ros2/install/cdrr_adaptive_ros2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base build/cdrr_adaptive_ros2 build --build-base /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/build install --record /home/awear/ros2_ws/src/cdrr_adaptive_ros2/build/cdrr_adaptive_ros2/install.log --single-version-externally-managed install_data
