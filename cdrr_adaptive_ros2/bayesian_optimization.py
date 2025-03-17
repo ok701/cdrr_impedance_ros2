@@ -3,44 +3,46 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32
 import numpy as np
-
-# matplotlib plot은 옵션에 따라 사용
 import matplotlib
-matplotlib.use('TkAgg')  # 환경에 따라 'Qt5Agg' 등으로 조정 가능
+matplotlib.use('TkAgg')  # Adjust backend as needed (e.g., 'Qt5Agg')
 import matplotlib.pyplot as plt
-
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from scipy.stats import norm
-
 import sys
 import argparse
 
-
 class BayesOptResistNode(Node):
     """
-    A ROS2 Node that performs Bayesian Optimization on a single parameter 'resist_level'.
-    - Range: [-20, 0] (음수일수록 더 큰 저항)
+    A ROS2 Node that performs Bayesian Optimization on a single parameter 'resist_level'
+    using Bayesian Quadratic Regression.
+    
+    - Range: [-20, 0] (more negative values represent higher resistance)
     - Cost function: cost = 0.4 * (MSE/100) + 0.6 * resist_level
-        => resist_level이 더 음수이면(cost 식에서 음수 기여), 최적화가 그쪽을 선호할 수 있음
-    - 1) 초기에 (resist_level = 0) → (resist_level = -10) 두 번 측정
-    - 2) 세 번째 측정부터 GP로 EI 최대점 탐색
-    - 3) 각 resist_level 당 N번 반복 측정 (기본 3번), outlier 제거 후 평균 cost를 GP에 사용
-    - 4) 최종 /resist_offset(Int32) 로 발행
-    - 실시간 점수, 실시간 Publish 등은 생략
-    - --show-plot 옵션 시, 각 iteration마다 GP Mean/Std + EI plot
+      (Lower cost is better.)
+    - Steps:
+        1) Initially measure two points: resist_level = 0 and resist_level = -10.
+        2) For each resist_level, perform N repeats (default 3), remove outliers,
+           and compute the average cost.
+        3) Use Bayesian Quadratic Regression (with a quadratic model f(x)=w1*x² + w2*x + w3)
+           to obtain the predictive mean and variance.
+        4) Use the Expected Improvement acquisition function to propose the next resist_level.
+        5) Finally, publish the result to /resist_offset (Int32).
+    - If the --show-plot option is set, the predictive mean, uncertainty, and data are plotted.
+    - The first --ignore-cycles cycles are completely ignored (no data is collected or processed).
+      Optimization starts only after those initial cycles.
     """
-
-    def __init__(self, repeats_per_level=3, max_runs=10, show_plot=False):
+    def __init__(self, repeats_per_level=3, max_runs=5, show_plot=True, ignore_cycles=5):
         super().__init__('bayes_opt_resist_node')
 
         # ---------------- Parameters ----------------
         self.repeats_per_level = repeats_per_level
         self.max_runs = max_runs
         self.show_plot = show_plot
+        self.ignore_cycles = ignore_cycles  # Number of cycles to ignore (no processing)
+        # We'll use run_count to decide when to start processing
+        self.run_count = 0
 
         # ---------------- ROS Topics ----------------
-        # Subscribe to /mes_pos, /ref_pos, /trigger
+        # Subscribe to /mes_pos, /ref_pos, /trigger topics
         self.mes_pos_sub = self.create_subscription(
             Int32,
             '/mes_pos',
@@ -59,7 +61,6 @@ class BayesOptResistNode(Node):
             self.trigger_callback,
             10
         )
-
         # Publish to /resist_offset (Int32)
         self.resist_pub = self.create_publisher(
             Int32,
@@ -70,56 +71,40 @@ class BayesOptResistNode(Node):
         # ---------------- Internal State ----------------
         self.trigger_state = 0
         self.collecting_data = False
-        self.ee_error_list = []  # per-run data
-
+        self.ee_error_list = []  # Data for the current run
         self.mes_pos = None
         self.ref_pos = None
 
-        # For Bayesian Optimization:
-        self.X = []  # tested resist_level
-        self.y = []  # cost
-        self.run_count = 0
+        # Data for optimization (only used after ignore_cycles):
+        self.X = []  # Tested resist_levels
+        self.y = []  # Corresponding cost values
 
-        # Repeats (같은 resist_level로 N번 반복)
+        # For repeating measurements at a given resist_level
         self.current_repeat_count = 0
         self.current_level_costs = []
 
-        # 초기 2점: [0, -10]
-        self.initial_candidates = [0.0, -10.0]
+        # Initial candidates: [0, -10]
+        self.initial_candidates = [0, -10.0]
+        self.next_resist_level = self.initial_candidates.pop(0)
 
-        # GP 설정
-        kernel = ConstantKernel(1.0) * RBF(length_scale=5.0, length_scale_bounds=(1.0, 20.0))
-        self.gp = GaussianProcessRegressor(
-            kernel=kernel,
-            alpha=10,
-            n_restarts_optimizer=5,
-            random_state=42
-        )
-
-        # 탐색 범위: [-20, 0]
+        # Define search bounds for resist_level
         self.lower_bound = -20.0
         self.upper_bound = 0.0
 
-        # 현재(또는 다음) 테스트할 resist_level
-        # 첫 번째는 initial_candidates[0] = 0
-        self.next_resist_level = self.initial_candidates.pop(0)
-
-        # (Optional) Plot setup
+        # ---------------- Plot Setup (Optional) ----------------
         if self.show_plot:
             plt.ion()
-            self.fig, (self.ax_gp, self.ax_acq) = plt.subplots(2, 1, figsize=(6, 8))
+            self.fig, self.ax = plt.subplots(figsize=(6, 4))
             self.fig.tight_layout(pad=3.0)
             self.fig.show()
 
-        # 시작 알림 및 첫 파라미터 Publish
         self.get_logger().info(
-            f"BayesOptResistNode started with repeats={self.repeats_per_level}, max_runs={self.max_runs}, show_plot={self.show_plot}"
+            f"BayesOptResistNode started with repeats={self.repeats_per_level}, "
+            f"max_runs={self.max_runs}, show_plot={self.show_plot}, ignore_cycles={self.ignore_cycles}"
         )
         self.publish_resist_level(self.next_resist_level)
 
-    # ------------------------------------------------------------------
-    #                       Subscriber Callbacks
-    # ------------------------------------------------------------------
+    # ---------------- Subscriber Callbacks ----------------
     def mes_pos_callback(self, msg: Int32):
         self.mes_pos = float(msg.data)
         self.compute_and_store_error()
@@ -130,240 +115,223 @@ class BayesOptResistNode(Node):
 
     def trigger_callback(self, msg: Int32):
         new_trigger = msg.data
+        # We assume a trigger transition: 0->1 starts, 1->0 ends a cycle.
         if new_trigger == 1 and self.trigger_state == 0:
-            # 0->1: start recording
             self.start_recording()
         elif new_trigger == 0 and self.trigger_state == 1:
-            # 1->0: end recording -> optimize
             self.stop_recording_and_optimize()
-
         self.trigger_state = new_trigger
 
-    # ------------------------------------------------------------------
-    #                       Data Recording
-    # ------------------------------------------------------------------
+    # ---------------- Data Recording ----------------
     def start_recording(self):
-        self.run_count += 1  # 새 run
-        self.get_logger().info(f"*** Trigger 0->1: Starting run #{self.run_count}, resist_level={self.next_resist_level:.2f}")
+        self.run_count += 1  # Increase run_count at the start of a cycle
+        self.get_logger().info(
+            f"*** Trigger 0->1: Starting run #{self.run_count}, resist_level={self.next_resist_level:.2f}"
+        )
         self.collecting_data = True
         self.ee_error_list = []
 
     def stop_recording_and_optimize(self):
+        # If we are in the ignore period, simply ignore this cycle.
+        if self.run_count <= self.ignore_cycles:
+            self.get_logger().info(
+                f"Cycle {self.run_count}/{self.ignore_cycles} ignored. No data processing."
+            )
+            self.collecting_data = False
+            self.ee_error_list = []  # Clear any collected data (if any)
+            self.publish_resist_level(self.next_resist_level)
+            return
+
         self.get_logger().info(f"*** Trigger 1->0: Ending run #{self.run_count}. Processing data.")
         self.collecting_data = False
-
         tested_level = self.next_resist_level
 
-        # 1) Compute cost from this single run
+        # Process collected data:
         cost_val = self.compute_cost_from_data(self.ee_error_list, tested_level)
         n_samples = len(self.ee_error_list)
         self.get_logger().info(f"   - Collected {n_samples} error samples. Cost = {cost_val:.5f}")
 
-        # 2) Store cost in current_level_costs
-        self.current_level_costs.append(cost_val)
-
-        # 3) Increase the repeat count
+        # Increment repeat count and store cost
         self.current_repeat_count += 1
-        self.get_logger().info(f"   - current_repeat_count = {self.current_repeat_count}/{self.repeats_per_level}")
+        self.current_level_costs.append(cost_val)
+        self.get_logger().info(
+            f"   - current_repeat_count = {self.current_repeat_count}/{self.repeats_per_level}"
+        )
 
-        # 4) Check if we need more repeats
+        # If not all repeats are done, republish the same resist_level and wait for next cycle
         if self.current_repeat_count < self.repeats_per_level:
-            # Re-publish the SAME resist_level
             self.get_logger().info("   - Still repeating the same resist_level; no new optimization step.")
             self.publish_resist_level(self.next_resist_level)
             return
 
-        # ----------------------------------------------------------------
-        # Repeats done for this resist_level
-        # ----------------------------------------------------------------
         self.get_logger().info(f"=== Repeats complete for resist_level={tested_level:.2f}. ===")
-
-        # (a) Log all repeated costs
         cost_str = ", ".join(f"{c:.5f}" for c in self.current_level_costs)
         self.get_logger().info(f"   - All repeated costs: [{cost_str}]")
 
-        # (b) Remove outliers
+        # Remove outliers from the repeated costs
         filtered_costs = self.remove_outliers(self.current_level_costs, k=1.3)
-        outliers = list(set(self.current_level_costs) - set(filtered_costs))
-        if len(outliers) > 0:
-            outlier_str = ", ".join(f"{c:.5f}" for c in outliers)
-            self.get_logger().warn(f"   - Outliers detected: [{outlier_str}]")
-        else:
-            self.get_logger().info("   - No outliers detected.")
-
         if len(filtered_costs) == 0:
             self.get_logger().warn("   - ALL repeats were outliers! Using raw data anyway.")
             filtered_costs = self.current_level_costs
 
-        # (c) Average the valid costs
-        final_cost_for_gp = float(np.mean(filtered_costs))
-        self.get_logger().info(f"   - Average cost after outlier removal: {final_cost_for_gp:.5f}")
+        final_cost = float(np.mean(filtered_costs))
+        self.get_logger().info(f"   - Average cost after outlier removal: {final_cost:.5f}")
 
-        # Clear for next
+        # Reset repeat counters for the next resist_level
         self.current_repeat_count = 0
         self.current_level_costs = []
 
-        # 5) Update GP dataset
+        # Update the optimization dataset with the current resist_level and its cost
         self.X.append(tested_level)
-        self.y.append(final_cost_for_gp)
+        self.y.append(final_cost)
 
-        # 6) Decide if we do further optimization
+        # Decide on the next action (if there is enough data, run Bayesian quadratic regression)
         if len(self.X) < self.max_runs:
-            # (A) If there's still an initial candidate, use that next
             if self.initial_candidates:
                 self.next_resist_level = self.initial_candidates.pop(0)
                 self.get_logger().info(f"   - Next is initial candidate: {self.next_resist_level:.2f}")
             else:
-                # (B) We do GP-based suggestion
-                self.get_logger().info("   - Running Bayesian Optimization iteration ...")
-                self.run_gp_and_suggest()
-
-            # Publish new level
+                self.run_bayesian_quad_and_suggest()
             self.publish_resist_level(self.next_resist_level)
         else:
             self.get_logger().info(f"Reached max_runs={self.max_runs}. No further optimization.")
-            self.publish_resist_level(0.0)  # 혹은 -20.0 등의 기본값
+            self.publish_resist_level(0.0)  # Or publish a default value
 
-    # ------------------------------------------------------------------
-    #             Compute and Store Error Each Time We Get Data
-    # ------------------------------------------------------------------
+    # ---------------- Compute and Store Error ----------------
     def compute_and_store_error(self):
         if self.collecting_data and (self.mes_pos is not None) and (self.ref_pos is not None):
             error_val = self.ref_pos - self.mes_pos
             self.ee_error_list.append(error_val)
 
-    # ------------------------------------------------------------------
-    #                       Cost Computation
-    # ------------------------------------------------------------------
+    # ---------------- Cost Computation ----------------
     def compute_cost_from_data(self, error_list, resist_level):
         """
-        cost = 0.4 * (MSE/100) + 0.6 * resist_level
+        Compute the cost based on:
+          cost = 0.4 * (MSE/100) + 0.6 * resist_level
         """
         if len(error_list) == 0:
             return 0.0
-
         mse = np.mean(np.square(error_list))
-        # scale MSE by 100
         mse_part = mse / 100.0
-
         cost_val = 0.4 * mse_part + 0.6 * resist_level
         return cost_val
 
-    # ------------------------------------------------------------------
-    #                 Remove Outliers from a List
-    # ------------------------------------------------------------------
+    # ---------------- Remove Outliers ----------------
     def remove_outliers(self, cost_list, k=1.3):
         """
-        Exclude values that are more than k std dev from the mean.
+        Exclude values that are more than k standard deviations away from the mean.
         Returns a filtered list of costs.
         """
         if len(cost_list) < 2:
             return cost_list
-
         mean_val = np.mean(cost_list)
         std_val = np.std(cost_list)
         if std_val == 0:
-            # all identical
             return cost_list
-
         filtered = [c for c in cost_list if abs(c - mean_val) <= k * std_val]
         return filtered
 
-    # ------------------------------------------------------------------
-    #                Bayesian Optimization Step
-    # ------------------------------------------------------------------
-    def run_gp_and_suggest(self):
-        X_data = np.array(self.X).reshape(-1, 1)
-        y_data = np.array(self.y)
+    # ---------------- Bayesian Quadratic Regression ----------------
+    def bayesian_quad_predict(self, x, sigma_p=1.0, sigma_n=1.0):
+        """
+        Predictive mean and variance for a given x using Bayesian Quadratic Regression.
+        The quadratic model is: f(x) = w1*x^2 + w2*x + w3.
+        Using a prior: p(w) = N(0, sigma_p^2 * I) and noise variance sigma_n^2.
+        """
+        X_arr = np.array(self.X)
+        y_arr = np.array(self.y)
+        # Construct design matrix for observed data
+        Phi = np.vstack([X_arr**2, X_arr, np.ones(len(X_arr))]).T  # shape (n, 3)
+        prior_cov = sigma_p**2 * np.eye(3)
+        Sigma_inv = (1/sigma_n**2) * (Phi.T @ Phi) + np.linalg.inv(prior_cov)
+        Sigma = np.linalg.inv(Sigma_inv)
+        mu_post = (1/sigma_n**2) * (Sigma @ (Phi.T @ y_arr))
+        phi_x = np.array([x**2, x, 1]).reshape(3, 1)
+        m = (phi_x.T @ mu_post).item()
+        v = (phi_x.T @ Sigma @ phi_x).item() + sigma_n**2
+        return m, v
 
-        # Fit GP
-        self.gp.fit(X_data, y_data)
+    def run_bayesian_quad_and_suggest(self):
+        """
+        Use Bayesian Quadratic Regression to fit a model to (X, y),
+        then use the Expected Improvement acquisition function to propose the next resist_level.
+        """
+        if len(self.X) < 3:
+            self.get_logger().warn("Not enough data for Bayesian quadratic regression. Keeping current resist_level.")
+            return
 
-        # Update plot if desired
-        if self.show_plot:
-            self.update_plot(X_data, y_data)
-
-        # Propose next resist_level by EI
-        self.next_resist_level = self.propose_next_resist(X_data, y_data)
-        self.get_logger().info(f"   - Proposed next resist_level: {self.next_resist_level:.2f}")
-
-    def propose_next_resist(self, X_data, y_data):
-        # Grid in [lower_bound, upper_bound]
-        candidates = np.linspace(self.lower_bound, self.upper_bound, 200).reshape(-1, 1)
-        ei_values = self.expected_improvement(candidates, X_data, y_data, self.gp, xi=0.001)
+        sigma_p = 1.0  # Prior standard deviation
+        sigma_n = 1.0  # Noise standard deviation
+        candidates = np.linspace(self.lower_bound, self.upper_bound, 200)
+        ei_values = []
+        f_best = min(self.y)  # Best (minimum) observed cost
+        xi = 0.001  # Exploration parameter
+        for x in candidates:
+            m, v = self.bayesian_quad_predict(x, sigma_p, sigma_n)
+            sigma = np.sqrt(v)
+            improvement = f_best - m - xi
+            if sigma > 0:
+                Z = improvement / sigma
+                ei = improvement * norm.cdf(Z) + sigma * norm.pdf(Z)
+            else:
+                ei = 0.0
+            ei_values.append(ei)
+        ei_values = np.array(ei_values)
         best_idx = np.argmax(ei_values)
-        return float(candidates[best_idx, 0])
+        proposed = candidates[best_idx]
+        self.next_resist_level = float(np.clip(proposed, self.lower_bound, self.upper_bound))
+        self.get_logger().info(
+            f"Bayesian quadratic regression suggests next resist_level: {self.next_resist_level:.2f}"
+        )
+        if self.show_plot:
+            self.update_plot_bayesian(sigma_p, sigma_n)
 
-    def expected_improvement(self, X_new, X, y, model, xi=0.01):
-        mu, sigma = model.predict(X_new, return_std=True)
-        y_min = np.min(y)
-        improvement = (y_min - mu) - xi
-        Z = improvement / sigma
-        # EI formula
-        ei = improvement * norm.cdf(Z) + sigma * norm.pdf(Z)
-        ei[sigma == 0.0] = 0.0
-        return ei
+    def update_plot_bayesian(self, sigma_p=1.0, sigma_n=1.0):
+        self.ax.clear()
+        self.ax.scatter(self.X, self.y, c='r', label='Data')
+        x_vals = np.linspace(self.lower_bound, self.upper_bound, 200)
+        means = []
+        stds = []
+        for x in x_vals:
+            m, v = self.bayesian_quad_predict(x, sigma_p, sigma_n)
+            means.append(m)
+            stds.append(np.sqrt(v))
+        means = np.array(means)
+        stds = np.array(stds)
+        self.ax.plot(x_vals, means, 'b-', label='Predictive Mean')
+        self.ax.fill_between(x_vals, means - stds, means + stds, color='blue', alpha=0.2, label='Uncertainty')
+        self.ax.set_title("Bayesian Quadratic Regression")
+        self.ax.set_xlabel("resist_level")
+        self.ax.set_ylabel("Cost (lower=better)")
+        self.ax.legend()
+        self.ax.grid(True)
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.2)
 
-    # ------------------------------------------------------------------
-    #                Publish Resist Level (Int32)
-    # ------------------------------------------------------------------
+    # ---------------- Publish Resist Level ----------------
     def publish_resist_level(self, level):
-        # 음수 실수 → int 변환 시 주의. 여기서는 round 후 int.
         out_msg = Int32()
         out_msg.data = int(round(level))
         self.resist_pub.publish(out_msg)
         self.get_logger().info(f"Published resist_offset={out_msg.data} to /resist_offset.")
 
-    # ------------------------------------------------------------------
-    #                      Plotting (if show_plot)
-    # ------------------------------------------------------------------
-    def update_plot(self, X_data, y_data):
-        self.ax_gp.clear()
-        self.ax_acq.clear()
-
-        # Plot range (maybe a bit wider than [-20,0] just for visualization)
-        X_plot = np.linspace(-25, 5, 200).reshape(-1, 1)
-        mu, std = self.gp.predict(X_plot, return_std=True)
-
-        # GP mean & std
-        self.ax_gp.plot(X_plot, mu, 'b-', label='GP Mean')
-        self.ax_gp.fill_between(
-            X_plot.ravel(), mu - std, mu + std,
-            alpha=0.2, color='blue', label='GP ±1σ'
-        )
-        self.ax_gp.scatter(X_data, y_data, c='r', label='Data')
-        self.ax_gp.set_title("Gaussian Process Model of the Cost")
-        self.ax_gp.set_xlabel("resist_level")
-        self.ax_gp.set_ylabel("Cost (lower=better)")
-        self.ax_gp.legend()
-        self.ax_gp.grid(True)
-
-        # Acquisition
-        ei_values = self.expected_improvement(X_plot, X_data, y_data, self.gp)
-        self.ax_acq.plot(X_plot, ei_values, 'g-', label='EI')
-        self.ax_acq.set_title("Acquisition Function (EI)")
-        self.ax_acq.set_xlabel("resist_level")
-        self.ax_acq.set_ylabel("EI")
-        self.ax_acq.legend()
-        self.ax_acq.grid(True)
-
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.2)
-
-
 def main(args=None):
-    parser = argparse.ArgumentParser(description="Bayesian Opt Resist Node")
+    parser = argparse.ArgumentParser(
+        description="Bayesian Opt Resist Node using Bayesian Quadratic Regression"
+    )
     parser.add_argument("--repeats", type=int, default=3, help="How many repeats per resist_level")
-    parser.add_argument("--max-runs", type=int, default=10, help="Max number of runs (i.e. distinct resist_levels)")
-    parser.add_argument("--show-plot", action='store_true', help="Show GP plot after each iteration")
+    parser.add_argument("--max-runs", type=int, default=5, help="Max number of runs (i.e. distinct resist_levels)")
+    parser.add_argument("--show-plot", action='store_true', help="Show Bayesian quadratic regression plot after each iteration")
+    parser.add_argument("--ignore-cycles", type=int, default=5, help="Number of cycles to ignore (do nothing) before starting optimization")
     known_args, _ = parser.parse_known_args()
 
     rclpy.init(args=sys.argv)
     node = BayesOptResistNode(
         repeats_per_level=known_args.repeats,
         max_runs=known_args.max_runs,
-        show_plot=known_args.show_plot
+        show_plot=known_args.show_plot,
+        ignore_cycles=known_args.ignore_cycles
     )
 
     try:
@@ -374,7 +342,6 @@ def main(args=None):
         node.get_logger().info("Shutting down BayesOptResistNode.")
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

@@ -11,8 +11,8 @@ class LinearEnvSimNode(Node):
         super().__init__('linear_env_sim')
         
         # Simulation parameters
-        self.mass = 10.0       # Mass in kg
-        self.b = 1           # Damping coefficient in N/(mm/s)
+        self.mass = 1       # Mass in kg
+        self.b = 0.01           # Damping coefficient in N/(mm/s)
         self.L = 500.0         # Maximum position in mm
         self.T = 10.0          # Total simulation time in seconds
         self.freq = freq
@@ -22,7 +22,7 @@ class LinearEnvSimNode(Node):
         # RBF network parameters
         self.n_rbf = 3
         self.centers = np.linspace(0, 500, self.n_rbf)  # Evenly spaced centers
-        self.sigma = 50.0       # RBF width
+        self.sigma = 150.0       # RBF width
         
         # Subscriptions
         self.trigger_sub = self.create_subscription(Int32, '/trigger', self.trigger_callback, 10)

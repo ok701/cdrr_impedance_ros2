@@ -23,6 +23,7 @@ setup(
             'adaptive_learning = cdrr_adaptive_ros2.adaptive_learning:main',
             'simulation_env = cdrr_adaptive_ros2.simulation_env:main',
             'visualization = cdrr_adaptive_ros2.visualization:main',
+            'bayesian_optimization = cdrr_adaptive_ros2.bayesian_optimization:main',
         ],
     },
 )
