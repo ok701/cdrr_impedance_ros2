@@ -1,347 +1,290 @@
 #!/usr/bin/env python3
+"""
+BOResistNode ― 실시간 Safe-BO + 데모 시각화 (타임아웃 로직 제거판)
+────────────────────────────────────────────────────────────────
+* Δ[mm], K[N/m]를 퍼블리시하여 실험 장치 제어
+* repeat_per_param 회 실험 후 GP(UCB) 업데이트
+* BO 업데이트 때마다 데모와 동일한 3-pane 그래프(EI·궤적·힘/K)를 표시
+* W_user 타임아웃( watchdog ) 기능은 **모두 비활성화**됨
+"""
+
+# ────── ROS ────────────────────────────────────────────────
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32
+
+# ────── 수치·시각화 ────────────────────────────────────────
 import numpy as np
-import matplotlib
-matplotlib.use('TkAgg')  # Adjust backend as needed (e.g., 'Qt5Agg')
 import matplotlib.pyplot as plt
+from matplotlib import cm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern
 from scipy.stats import norm
-import sys
-import argparse
 
-class BayesOptResistNode(Node):
+# ────── 데모 시뮬레이션 상수 ───────────────────────────────
+T, DT = 10.0, 0.001
+TIME  = np.arange(0, T, DT)
+F_STEP = 1.0
+MASS   = 1.0
+B_DAMP = 4.0
+
+def _min_jerk(s):
+    """minimum-jerk trajectory profile"""
+    return 10*s**3 - 15*s**4 + 6*s**5
+
+
+class BOResistNode(Node):
     """
-    A ROS2 Node that performs Bayesian Optimization on a single parameter 'resist_level'
-    using Bayesian Quadratic Regression.
-    
-    - Range: [-20, 0] (more negative values represent higher resistance)
-    - Cost function: cost = 0.4 * (MSE/100) + 0.6 * resist_level
-      (Lower cost is better.)
-    - Steps:
-        1) Initially measure two points: resist_level = 0 and resist_level = -10.
-        2) For each resist_level, perform N repeats (default 3), remove outliers,
-           and compute the average cost.
-        3) Use Bayesian Quadratic Regression (with a quadratic model f(x)=w1*x² + w2*x + w3)
-           to obtain the predictive mean and variance.
-        4) Use the Expected Improvement acquisition function to propose the next resist_level.
-        5) Finally, publish the result to /resist_offset (Int32).
-    - If the --show-plot option is set, the predictive mean, uncertainty, and data are plotted.
-    - The first --ignore-cycles cycles are completely ignored (no data is collected or processed).
-      Optimization starts only after those initial cycles.
+    Safe-BO 노드 (trigger 버전 + 시각화, 타임아웃 제거)
+    trigger = 1000(=1.0) 동안 한 세트 측정 → 세트 종료 직후 /w_user 값 하나 사용
     """
-    def __init__(self, repeats_per_level=3, max_runs=5, show_plot=True, ignore_cycles=5):
-        super().__init__('bayes_opt_resist_node')
 
-        # ---------------- Parameters ----------------
-        self.repeats_per_level = repeats_per_level
-        self.max_runs = max_runs
-        self.show_plot = show_plot
-        self.ignore_cycles = ignore_cycles  # Number of cycles to ignore (no processing)
-        # We'll use run_count to decide when to start processing
-        self.run_count = 0
+    # ────────── 초기화 ────────────────────────────────────
+    def __init__(self):
+        super().__init__("bo_resist_node")
 
-        # ---------------- ROS Topics ----------------
-        # Subscribe to /mes_pos, /ref_pos, /trigger topics
-        self.mes_pos_sub = self.create_subscription(
-            Int32,
-            '/mes_pos',
-            self.mes_pos_callback,
-            10
-        )
-        self.ref_pos_sub = self.create_subscription(
-            Int32,
-            '/ref_pos',
-            self.ref_pos_callback,
-            10
-        )
-        self.trigger_sub = self.create_subscription(
-            Int32,
-            '/trigger',
-            self.trigger_callback,
-            10
-        )
-        # Publish to /resist_offset (Int32)
-        self.resist_pub = self.create_publisher(
-            Int32,
-            '/resist_offset',
-            10
+        # ---------- 파라미터 ----------
+        self.declare_parameter("beta",              2.0)
+        self.declare_parameter("box_delta_min",   100)
+        self.declare_parameter("box_delta_max",  1000)
+        self.declare_parameter("box_k_min",          0)
+        self.declare_parameter("box_k_max",         20)
+        self.declare_parameter("repeats_per_param", 3)
+        self.declare_parameter("ignore_cycles",     0)
+        self.declare_parameter("enable_plot",    True)
+
+        self.beta        = self.get_parameter("beta").value
+        dm, dM           = (self.get_parameter("box_delta_min").value,
+                            self.get_parameter("box_delta_max").value)
+        km, kM           = (self.get_parameter("box_k_min").value,
+                            self.get_parameter("box_k_max").value)
+        self.box         = np.array([[dm, dM], [km, kM]])
+        self.repeats_per_param = self.get_parameter("repeats_per_param").value
+        self.ignore_cycles     = self.get_parameter("ignore_cycles").value
+        self.enable_plot       = self.get_parameter("enable_plot").value
+
+        # ---------- BO 구조 ----------
+        self.X, self.Y = [], []              # Δ,K   /   cost(= –W_user)
+        self.gp = GaussianProcessRegressor(
+            kernel=Matern(nu=2.5), alpha=1e-6, normalize_y=True
         )
 
-        # ---------------- Internal State ----------------
-        self.trigger_state = 0
-        self.collecting_data = False
-        self.ee_error_list = []  # Data for the current run
-        self.mes_pos = None
-        self.ref_pos = None
+        # 초기 두 점
+        self.candidate_queue = [[dm, (km + kM) / 2],
+                                [(dm + dM)//2, (km + kM)//2]]
+        self.current_param = self.candidate_queue.pop(0)
+        self.repeats_done  = 0
+        self.cycles_seen   = 0
 
-        # Data for optimization (only used after ignore_cycles):
-        self.X = []  # Tested resist_levels
-        self.y = []  # Corresponding cost values
+        # ---------- ROS 통신 ----------
+        qos = rclpy.qos.QoSProfile(depth=10)
+        self.sub_trigger = self.create_subscription(
+            Int32, "/trigger", self.cb_trigger, qos)
+        self.sub_w = self.create_subscription(
+            Int32, "/w_user", self.cb_w, qos)
 
-        # For repeating measurements at a given resist_level
-        self.current_repeat_count = 0
-        self.current_level_costs = []
+        self.pub_delta = self.create_publisher(Int32, "/lead_margin", 10)
+        self.pub_k     = self.create_publisher(Int32, "/resist_k",    10)
 
-        # Initial candidates: [0, -10]
-        self.initial_candidates = [0, -10.0]
-        self.next_resist_level = self.initial_candidates.pop(0)
+        # ---------- 상태 ----------
+        self.collecting       = False
+        self.latest_w         = None
+        self.prev_trigger_val = 0.0        # ← 상승·하강 에지 검출용
 
-        # Define search bounds for resist_level
-        self.lower_bound = -20.0
-        self.upper_bound = 0.0
+        # (watchdog 타이머 완전 제거)
 
-        # ---------------- Plot Setup (Optional) ----------------
-        if self.show_plot:
-            plt.ion()
-            self.fig, self.ax = plt.subplots(figsize=(6, 4))
-            self.fig.tight_layout(pad=3.0)
-            self.fig.show()
+        # 첫 파라미터 퍼블리시
+        self.publish_param()
+        self.get_logger().info("BOResistNode (trigger, viz, no-timeout) started.")
+        self.get_logger().info(f"초기 Δ={self.current_param[0]}, "
+                               f"K={self.current_param[1]}")
 
-        self.get_logger().info(
-            f"BayesOptResistNode started with repeats={self.repeats_per_level}, "
-            f"max_runs={self.max_runs}, show_plot={self.show_plot}, ignore_cycles={self.ignore_cycles}"
-        )
-        self.publish_resist_level(self.next_resist_level)
+    # ────────── /trigger 콜백 ─────────────────────────────
+    def cb_trigger(self, msg: Int32):
+        trig = msg.data / 1000.0
+        rising  = (self.prev_trigger_val != 1.0) and (trig == 1.0)
+        falling = (self.prev_trigger_val == 1.0) and (trig != 1.0)
+        self.prev_trigger_val = trig
 
-    # ---------------- Subscriber Callbacks ----------------
-    def mes_pos_callback(self, msg: Int32):
-        self.mes_pos = float(msg.data)
-        self.compute_and_store_error()
-
-    def ref_pos_callback(self, msg: Int32):
-        self.ref_pos = float(msg.data)
-        self.compute_and_store_error()
-
-    def trigger_callback(self, msg: Int32):
-        new_trigger = msg.data
-        # We assume a trigger transition: 0->1 starts, 1->0 ends a cycle.
-        if new_trigger == 1 and self.trigger_state == 0:
-            self.start_recording()
-        elif new_trigger == 0 and self.trigger_state == 1:
-            self.stop_recording_and_optimize()
-        self.trigger_state = new_trigger
-
-    # ---------------- Data Recording ----------------
-    def start_recording(self):
-        self.run_count += 1  # Increase run_count at the start of a cycle
-        self.get_logger().info(
-            f"*** Trigger 0->1: Starting run #{self.run_count}, resist_level={self.next_resist_level:.2f}"
-        )
-        self.collecting_data = True
-        self.ee_error_list = []
-
-    def stop_recording_and_optimize(self):
-        # If we are in the ignore period, simply ignore this cycle.
-        if self.run_count <= self.ignore_cycles:
+        if rising:                                    # 세트 시작
+            self.collecting = True
+            self.latest_w = None
             self.get_logger().info(
-                f"Cycle {self.run_count}/{self.ignore_cycles} ignored. No data processing."
-            )
-            self.collecting_data = False
-            self.ee_error_list = []  # Clear any collected data (if any)
-            self.publish_resist_level(self.next_resist_level)
+                f"--- Cycle {self.cycles_seen + 1} START (trigger↑) ---")
+
+        elif falling and self.collecting:             # 세트 종료
+            self.collecting = False
+            self.get_logger().info(
+                f"--- Cycle {self.cycles_seen + 1} END (trigger↓) --- "
+                "(대기: /w_user)")
+            self.finish_cycle()
+
+    # ────────── /w_user 콜백 ────────────────────────────
+    def cb_w(self, msg: Int32):
+        if not self.collecting and self.latest_w is None:
+            self.latest_w = float(msg.data) / 1000.0  # mJ → J
+            self.get_logger().info(f"    ↳ /w_user: {self.latest_w:.3f} J")
+
+    # ────────── 세트 완료 처리 ──────────────────────────
+    def finish_cycle(self):
+        self.cycles_seen += 1
+
+        if self.cycles_seen <= self.ignore_cycles:
+            self.get_logger().info(
+                f"Cycle {self.cycles_seen} 무시 (ignore_cycles)")
+            return
+        if self.latest_w is None:
+            self.get_logger().warn("W_user 미수신 → 건너뜀")
             return
 
-        self.get_logger().info(f"*** Trigger 1->0: Ending run #{self.run_count}. Processing data.")
-        self.collecting_data = False
-        tested_level = self.next_resist_level
-
-        # Process collected data:
-        cost_val = self.compute_cost_from_data(self.ee_error_list, tested_level)
-        n_samples = len(self.ee_error_list)
-        self.get_logger().info(f"   - Collected {n_samples} error samples. Cost = {cost_val:.5f}")
-
-        # Increment repeat count and store cost
-        self.current_repeat_count += 1
-        self.current_level_costs.append(cost_val)
+        cost = -self.latest_w
+        self.X.append(self.current_param)
+        self.Y.append(cost)
+        self.repeats_done += 1
         self.get_logger().info(
-            f"   - current_repeat_count = {self.current_repeat_count}/{self.repeats_per_level}"
-        )
+            f"[cycle {self.cycles_seen}] Δ={self.current_param[0]}, "
+            f"K={self.current_param[1]}, W={self.latest_w:.3f} J "
+            f"(repeat {self.repeats_done}/{self.repeats_per_param})")
 
-        # If not all repeats are done, republish the same resist_level and wait for next cycle
-        if self.current_repeat_count < self.repeats_per_level:
-            self.get_logger().info("   - Still repeating the same resist_level; no new optimization step.")
-            self.publish_resist_level(self.next_resist_level)
-            return
+        if self.repeats_done >= self.repeats_per_param:
+            self.repeats_done = 0
+            self.get_logger().info("  ↳ repeat 완료 → BO 업데이트")
+            self.run_bo_step()
 
-        self.get_logger().info(f"=== Repeats complete for resist_level={tested_level:.2f}. ===")
-        cost_str = ", ".join(f"{c:.5f}" for c in self.current_level_costs)
-        self.get_logger().info(f"   - All repeated costs: [{cost_str}]")
+    # ────────── BO 업데이트 + 시각화 ────────────────────
+    def run_bo_step(self):
+        X_arr, Y_arr = np.array(self.X), np.array(self.Y)
+        self.gp.fit(X_arr, Y_arr)
 
-        # Remove outliers from the repeated costs
-        filtered_costs = self.remove_outliers(self.current_level_costs, k=1.3)
-        if len(filtered_costs) == 0:
-            self.get_logger().warn("   - ALL repeats were outliers! Using raw data anyway.")
-            filtered_costs = self.current_level_costs
+        # UCB 그리드 탐색
+        d_lin = np.linspace(*self.box[0], 40)
+        k_lin = np.linspace(*self.box[1], 40)
+        grid  = np.array([[d, k] for d in d_lin for k in k_lin])
 
-        final_cost = float(np.mean(filtered_costs))
-        self.get_logger().info(f"   - Average cost after outlier removal: {final_cost:.5f}")
+        mu, sig = self.gp.predict(grid, return_std=True)
+        ucb     = mu - self.beta * sig
+        best    = grid[np.argmin(ucb)]
+        self.current_param = best.tolist()
+        self.publish_param()
+        self.get_logger().info(
+            f" → new param Δ={best[0]:.0f}, K={best[1]:.1f}")
 
-        # Reset repeat counters for the next resist_level
-        self.current_repeat_count = 0
-        self.current_level_costs = []
+        if self.enable_plot:
+            try:
+                self._plot_visuals(grid)
+            except Exception as e:
+                self.get_logger().warn(f"시각화 실패: {e}")
 
-        # Update the optimization dataset with the current resist_level and its cost
-        self.X.append(tested_level)
-        self.y.append(final_cost)
+    # ────────── Expected Improvement ───────────────────
+    def _expected_improv(self, cand):
+        mu, sig = self.gp.predict(cand, return_std=True)
+        sig = np.maximum(sig, 1e-9)
+        imp = np.min(self.Y) - mu
+        Z   = imp / sig
+        ei  = imp * norm.cdf(Z) + sig * norm.pdf(Z)
+        ei[sig == 0] = 0
+        return ei
 
-        # Decide on the next action (if there is enough data, run Bayesian quadratic regression)
-        if len(self.X) < self.max_runs:
-            if self.initial_candidates:
-                self.next_resist_level = self.initial_candidates.pop(0)
-                self.get_logger().info(f"   - Next is initial candidate: {self.next_resist_level:.2f}")
-            else:
-                self.run_bayesian_quad_and_suggest()
-            self.publish_resist_level(self.next_resist_level)
+    # ────────── 시각화 루틴 ────────────────────────────
+    def _plot_visuals(self, grid):
+        d_lin = np.linspace(*self.box[0], 40)
+        k_lin = np.linspace(*self.box[1], 40)
+        D, K_mesh = np.meshgrid(d_lin, k_lin)
+        EI = self._expected_improv(grid).reshape(D.shape)
+
+        d_mm, k_val = self.current_param
+        W_sim, x_ref, x_act, F_user, mask = self._simulate_demo(d_mm, k_val)
+
+        fig = plt.figure(figsize=(11, 4.5))
+
+        # (1) EI contour
+        ax1 = fig.add_subplot(1, 3, 1)
+        cs  = ax1.contourf(D, K_mesh, EI, 20, cmap=cm.viridis)
+        ax1.scatter(*np.array(self.X).T, c='red')
+        ax1.set(xlabel='Δ [mm]', ylabel='K [N/m]', title='Expected Improvement')
+        fig.colorbar(cs, ax=ax1)
+
+        # (2) Trajectory
+        ax2 = fig.add_subplot(1, 3, 2)
+        ax2.plot(TIME, x_ref, label='ref')
+        ax2.plot(TIME, x_act, label='act')
+        ax2.set(xlabel='time [s]', ylabel='pos',
+                title=f'Trajectory  (cycle {self.cycles_seen})')
+        ax2.legend()
+
+        # (3) Force & K timeline
+        ax3  = fig.add_subplot(1, 3, 3)
+        ax3.plot(TIME, F_user, label='F_user')
+        ax3.set(xlabel='time [s]', ylabel='F_user [N]',
+                title='User force & K timeline')
+
+        ax3b = ax3.twinx()
+        K_vis = np.where(mask, k_val, 0.0)
+        ax3b.plot(TIME, K_vis, 'r', lw=2, label='K_resist')
+        ax3b.set_ylabel('K_resist [N/m]')
+        ax3b.set_ylim(0, self.box[1, 1])
+
+        ax3.legend(loc='upper left'); ax3b.legend(loc='upper right')
+        plt.tight_layout()
+
+        # head-less 환경이면 PNG 저장, 아니면 창 표시
+        if not plt.get_backend().lower().startswith("qt"):
+            fname = f"/tmp/bo_cycle_{self.cycles_seen:03d}.png"
+            fig.savefig(fname, dpi=120)
+            self.get_logger().info(f"그래프 저장: {fname}")
+            plt.close(fig)
         else:
-            self.get_logger().info(f"Reached max_runs={self.max_runs}. No further optimization.")
-            self.publish_resist_level(0.0)  # Or publish a default value
+            plt.show()
 
-    # ---------------- Compute and Store Error ----------------
-    def compute_and_store_error(self):
-        if self.collecting_data and (self.mes_pos is not None) and (self.ref_pos is not None):
-            error_val = self.ref_pos - self.mes_pos
-            self.ee_error_list.append(error_val)
+    # ────────── 데모용 시뮬레이션 ───────────────────────
+    def _simulate_demo(self, d_mm: float, k_val: float):
+        Δ = d_mm / 1000.0
+        x_ref = _min_jerk(TIME / T)
+        v_ref = np.gradient(x_ref, DT)
 
-    # ---------------- Cost Computation ----------------
-    def compute_cost_from_data(self, error_list, resist_level):
-        """
-        Compute the cost based on:
-          cost = 0.4 * (MSE/100) + 0.6 * resist_level
-        """
-        if len(error_list) == 0:
-            return 0.0
-        mse = np.mean(np.square(error_list))
-        mse_part = mse / 100.0
-        cost_val = 0.4 * mse_part + 0.6 * resist_level
-        return cost_val
+        x_act = np.zeros_like(TIME)
+        v_act = np.zeros_like(TIME)
+        F_user = (x_ref > 0.5) * F_STEP
+        F_res  = np.zeros_like(TIME)
+        mask   = np.zeros_like(TIME, dtype=bool)
 
-    # ---------------- Remove Outliers ----------------
-    def remove_outliers(self, cost_list, k=1.3):
-        """
-        Exclude values that are more than k standard deviations away from the mean.
-        Returns a filtered list of costs.
-        """
-        if len(cost_list) < 2:
-            return cost_list
-        mean_val = np.mean(cost_list)
-        std_val = np.std(cost_list)
-        if std_val == 0:
-            return cost_list
-        filtered = [c for c in cost_list if abs(c - mean_val) <= k * std_val]
-        return filtered
+        resist_on = False
+        for k in range(1, len(TIME)):
+            lead = x_act[k-1] - x_ref[k-1]
+            if not resist_on and lead > Δ:
+                resist_on = True
+            if resist_on:
+                rel_vel  = v_act[k-1] - v_ref[k-1]
+                F_res[k] = k_val * (lead - Δ) + B_DAMP * rel_vel
+                mask[k]  = True
+            a        = (F_user[k] - F_res[k]) / MASS
+            v_act[k] = v_act[k-1] + a * DT
+            x_act[k] = x_act[k-1] + v_act[k] * DT
 
-    # ---------------- Bayesian Quadratic Regression ----------------
-    def bayesian_quad_predict(self, x, sigma_p=1.0, sigma_n=1.0):
-        """
-        Predictive mean and variance for a given x using Bayesian Quadratic Regression.
-        The quadratic model is: f(x) = w1*x^2 + w2*x + w3.
-        Using a prior: p(w) = N(0, sigma_p^2 * I) and noise variance sigma_n^2.
-        """
-        X_arr = np.array(self.X)
-        y_arr = np.array(self.y)
-        # Construct design matrix for observed data
-        Phi = np.vstack([X_arr**2, X_arr, np.ones(len(X_arr))]).T  # shape (n, 3)
-        prior_cov = sigma_p**2 * np.eye(3)
-        Sigma_inv = (1/sigma_n**2) * (Phi.T @ Phi) + np.linalg.inv(prior_cov)
-        Sigma = np.linalg.inv(Sigma_inv)
-        mu_post = (1/sigma_n**2) * (Sigma @ (Phi.T @ y_arr))
-        phi_x = np.array([x**2, x, 1]).reshape(3, 1)
-        m = (phi_x.T @ mu_post).item()
-        v = (phi_x.T @ Sigma @ phi_x).item() + sigma_n**2
-        return m, v
+        W_user = np.trapezoid(F_user * v_act, dx=DT)
+        return W_user, x_ref, x_act, F_user, mask
 
-    def run_bayesian_quad_and_suggest(self):
-        """
-        Use Bayesian Quadratic Regression to fit a model to (X, y),
-        then use the Expected Improvement acquisition function to propose the next resist_level.
-        """
-        if len(self.X) < 3:
-            self.get_logger().warn("Not enough data for Bayesian quadratic regression. Keeping current resist_level.")
-            return
+    # ────────── 파라미터 퍼블리시 ──────────────────────
+    def publish_param(self):
+        d_msg, k_msg = Int32(), Int32()
+        d_msg.data = int(round(self.current_param[0]))
+        k_msg.data = int(round(self.current_param[1]))
+        self.pub_delta.publish(d_msg)
+        self.pub_k.publish(k_msg)
 
-        sigma_p = 1.0  # Prior standard deviation
-        sigma_n = 1.0  # Noise standard deviation
-        candidates = np.linspace(self.lower_bound, self.upper_bound, 200)
-        ei_values = []
-        f_best = min(self.y)  # Best (minimum) observed cost
-        xi = 0.001  # Exploration parameter
-        for x in candidates:
-            m, v = self.bayesian_quad_predict(x, sigma_p, sigma_n)
-            sigma = np.sqrt(v)
-            improvement = f_best - m - xi
-            if sigma > 0:
-                Z = improvement / sigma
-                ei = improvement * norm.cdf(Z) + sigma * norm.pdf(Z)
-            else:
-                ei = 0.0
-            ei_values.append(ei)
-        ei_values = np.array(ei_values)
-        best_idx = np.argmax(ei_values)
-        proposed = candidates[best_idx]
-        self.next_resist_level = float(np.clip(proposed, self.lower_bound, self.upper_bound))
-        self.get_logger().info(
-            f"Bayesian quadratic regression suggests next resist_level: {self.next_resist_level:.2f}"
-        )
-        if self.show_plot:
-            self.update_plot_bayesian(sigma_p, sigma_n)
 
-    def update_plot_bayesian(self, sigma_p=1.0, sigma_n=1.0):
-        self.ax.clear()
-        self.ax.scatter(self.X, self.y, c='r', label='Data')
-        x_vals = np.linspace(self.lower_bound, self.upper_bound, 200)
-        means = []
-        stds = []
-        for x in x_vals:
-            m, v = self.bayesian_quad_predict(x, sigma_p, sigma_n)
-            means.append(m)
-            stds.append(np.sqrt(v))
-        means = np.array(means)
-        stds = np.array(stds)
-        self.ax.plot(x_vals, means, 'b-', label='Predictive Mean')
-        self.ax.fill_between(x_vals, means - stds, means + stds, color='blue', alpha=0.2, label='Uncertainty')
-        self.ax.set_title("Bayesian Quadratic Regression")
-        self.ax.set_xlabel("resist_level")
-        self.ax.set_ylabel("Cost (lower=better)")
-        self.ax.legend()
-        self.ax.grid(True)
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.2)
-
-    # ---------------- Publish Resist Level ----------------
-    def publish_resist_level(self, level):
-        out_msg = Int32()
-        out_msg.data = int(round(level))
-        self.resist_pub.publish(out_msg)
-        self.get_logger().info(f"Published resist_offset={out_msg.data} to /resist_offset.")
-
-def main(args=None):
-    parser = argparse.ArgumentParser(
-        description="Bayesian Opt Resist Node using Bayesian Quadratic Regression"
-    )
-    parser.add_argument("--repeats", type=int, default=3, help="How many repeats per resist_level")
-    parser.add_argument("--max-runs", type=int, default=5, help="Max number of runs (i.e. distinct resist_levels)")
-    parser.add_argument("--show-plot", action='store_true', help="Show Bayesian quadratic regression plot after each iteration")
-    parser.add_argument("--ignore-cycles", type=int, default=5, help="Number of cycles to ignore (do nothing) before starting optimization")
-    known_args, _ = parser.parse_known_args()
-
-    rclpy.init(args=sys.argv)
-    node = BayesOptResistNode(
-        repeats_per_level=known_args.repeats,
-        max_runs=known_args.max_runs,
-        show_plot=known_args.show_plot,
-        ignore_cycles=known_args.ignore_cycles
-    )
-
+# ────────── main ───────────────────────────────────────
+def main():
+    rclpy.init()
+    node = BOResistNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.get_logger().info("Shutting down BayesOptResistNode.")
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
