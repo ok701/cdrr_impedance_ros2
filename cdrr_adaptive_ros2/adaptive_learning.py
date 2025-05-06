@@ -7,9 +7,7 @@ import argparse
 
 class RBFController:
     def __init__(self, eta=0.0005, n_rbf=3, centers=None, sigma=0.3, forgetting_factor=1, initial_weights=None, train=True):
-        """
-        RBF Controller with online learning.
-        
+        """  
         :param eta: Learning rate.
         :param n_rbf: Number of RBF units.
         :param centers: Array of RBF centers; if None, set to n_rbf evenly spaced between 0 and 1.
@@ -35,17 +33,9 @@ class RBFController:
 
     def compute_control(self, x_measured, x_reference, dt=0.02, tau_f=15.0):
         error = x_reference - x_measured
-        # phi = np.exp(-((x_reference - self.centers)**2) / (2 * self.sigma**2))
         phi = np.exp(-((x_measured - self.centers)**2) / (2 * self.sigma**2))
         f_rbfn = np.dot(self.weights, phi)
-
-        
-        # Online weight update only if training is enabled
        
-        # if self.train:
-        #     decay_factor = dt / tau_f
-        #     # self.weights = self.forgetting_factor * self.weights + self.eta * error * phi
-        #     self.weights = self.weights - decay_factor * (phi * phi) * self.weights + self.eta * error * phi
         if self.train:
             if self.use_forgetting_factor:
                 decay_factor = dt / tau_f
@@ -60,19 +50,17 @@ class AdaptiveLearningNode(Node):
     def __init__(self, freq=50.0):
         super().__init__('adaptive_learning')
         self.dt = 1.0 / freq
-        self.rbf_controller = RBFController()  # default: 3 RBFs as per our specification
+        self.rbf_controller = RBFController() 
         self.cycle = 0
 
         self.end_call_count = 0
 
-        # Subscribers: actual (mes) position, reference position, and trigger
+        # Subscribers
         self.create_subscription(Int32, '/mes_position', self.mes_pos_callback, 10)
         self.create_subscription(Int32, '/ref_position', self.ref_pos_callback, 10)
         self.create_subscription(Int32, '/trigger', self.trigger_callback, 10)
 
-        # Publisher for RBF weights as an integer array
-        # self.weights_pub = self.create_publisher(Int32MultiArray, '/rbf_weights', 10)
-        # self.ref_tension_pub = self.create_publisher(Int32, '/ref_tension', 10)  # for the simulation
+        # Publishers
         self.rbf_w1_pub = self.create_publisher(Int32, '/rbf_w1', 10)
         self.rbf_w2_pub = self.create_publisher(Int32, '/rbf_w2', 10)
         self.rbf_w3_pub = self.create_publisher(Int32, '/rbf_w3', 10)
@@ -86,12 +74,10 @@ class AdaptiveLearningNode(Node):
         # self.get_logger().info(f"AdaptiveLearningNode started at {freq} Hz.")
 
     def mes_pos_callback(self, msg: Int32):
-        self.x_measured = float(msg.data)
-        self.x_measured = self.x_measured / 1000.0  
+        self.x_measured = float(msg.data) / 1000.0  # Convert to meters
 
     def ref_pos_callback(self, msg: Int32):
-        self.x_reference = float(msg.data)
-        self.x_reference = self.x_reference / 1000.0
+        self.x_reference = float(msg.data) / 1000.0
 
     def trigger_callback(self, msg: Int32):
         self.trigger_state = msg.data / 1000
@@ -104,6 +90,7 @@ class AdaptiveLearningNode(Node):
         if self.x_measured is None or self.x_reference is None:
             return
         prev_train_state = self.rbf_controller.train
+        
         # Enable online learning only when the trigger is active (== 1)
         if self.trigger_state == 1 and self.end_call_count < 5:
             self.rbf_controller.train = True
